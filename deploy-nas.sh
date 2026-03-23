@@ -5,8 +5,8 @@ NAS_IP="172.30.1.85"
 TARGET_DIR="/volume1/docker/sns-project"
 
 echo "🚀 Starting Deployment to NAS (172.30.1.85)..."
-echo "📁 Verifying remote directory..."
-ssh -p 8096 duang96@$NAS_IP "mkdir -p $TARGET_DIR"
+echo "📁 Cleaning & Verifying remote directory..."
+ssh -p 8096 duang96@$NAS_IP "rm -rf $TARGET_DIR/src && mkdir -p $TARGET_DIR"
 
 # 극단적인 SCP/Rsync 차단 회피: tar ssh stream
 echo "📦 Compress & Stream: Transferring code via encrypted SSH tunnel..."

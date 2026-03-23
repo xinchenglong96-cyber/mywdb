@@ -1,6 +1,6 @@
 "use client"
 
-import { useState, useEffect, useCallback } from "react"
+import { useState, useEffect, useCallback, useRef } from "react"
 import { supabase } from "@/lib/supabase"
 import { Avatar, AvatarFallback } from "@/components/ui/avatar"
 import { Button } from "@/components/ui/button"
@@ -175,6 +175,17 @@ const MediaCarousel = ({ urls }: { urls: string[] }) => {
 
 export default function FeedPage() {
   const [logs, setLogs] = useState<LogItem[]>([]);
+  const [confirmState, setConfirmState] = useState<any>(null);
+  const [page, setPage] = useState(0);
+  const [hasMore, setHasMore] = useState(true);
+  const [blockedUsers, setBlockedUsers] = useState<string[]>([]);
+  const [loadingMore, setLoadingMore] = useState(false);
+  const loadMoreRef = useRef<HTMLDivElement | null>(null);
+
+  // 신고 모달 상태
+  const [reportModalOpen, setReportModalOpen] = useState(false);
+  const [reportTargetId, setReportTargetId] = useState<string | null>(null);
+  const [reportReason, setReportReason] = useState("");
   const [isLoading, setIsLoading] = useState(false);
   const [myUserId, setMyUserId] = useState<string | null>(null);
   const [sessionUser, setSessionUser] = useState<any>(null); // { nickname, avatar_url, email }
@@ -273,8 +284,8 @@ export default function FeedPage() {
     initAuth();
   }, []);
 
-  const fetchLogs = useCallback(async () => {
-    setIsLoading(true);
+  const fetchLogs = useCallback(async (pageNum = 0, currentBlocked: string[] = blockedUsers) => {
+    if (pageNum === 0) setIsLoading(true);
     let query = supabase
       .from('logs')
       .select(`
@@ -286,24 +297,112 @@ export default function FeedPage() {
           users ( nickname )
         )
       `)
-      .order('created_at', { ascending: false });
+      .order('created_at', { ascending: false })
+      .range(pageNum * 10, (pageNum + 1) * 10 - 1);
 
     if (filterUserId) query = query.eq('user_id', filterUserId);
     if (filterProjectId) query = query.eq('project_id', filterProjectId);
+    if (currentBlocked.length > 0) {
+      query = query.not('user_id', 'in', `(${currentBlocked.join(',')})`);
+    }
 
     const { data: logsData, error } = await query;
 
     if (error) {
       console.error("logs 불러오기 에러:", error);
     } else if (logsData) {
-      setLogs(logsData as any);
+      if (logsData.length < 10) setHasMore(false);
+      else setHasMore(true);
+
+      if (pageNum === 0) {
+        setLogs(logsData as any);
+      } else {
+        setLogs(prev => {
+          const existingIds = new Set(prev.map(l => l.id));
+          const newLogs = logsData.filter(l => !existingIds.has(l.id));
+          return [...prev, ...newLogs as any];
+        });
+      }
     }
-    setIsLoading(false);
-  }, [filterUserId, filterProjectId]);
+    if (pageNum === 0) setIsLoading(false);
+    setLoadingMore(false);
+  }, [filterUserId, filterProjectId, blockedUsers]);
+
+  const loadBlockedUsers = useCallback(async (userId: string) => {
+    const { data, error } = await supabase.from('blocks').select('blocked_id').eq('blocker_id', userId);
+    if (!error && data) {
+      const blockedIds = data.map(b => b.blocked_id);
+      setBlockedUsers(blockedIds);
+      return blockedIds;
+    }
+    return [];
+  }, []);
 
   useEffect(() => {
-    fetchLogs();
-  }, [fetchLogs]);
+    if (myUserId) {
+      loadBlockedUsers(myUserId).then((blockedIds) => {
+        fetchLogs(0, blockedIds);
+      });
+    } else {
+      fetchLogs(0, []);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [myUserId, filterUserId, filterProjectId]);
+
+  useEffect(() => {
+    if (isLoading || loadingMore || !hasMore) return;
+    const observer = new IntersectionObserver(
+      entries => {
+        if (entries[0].isIntersecting && hasMore && !loadingMore) {
+          setLoadingMore(true);
+          setPage(p => {
+            const next = p + 1;
+            fetchLogs(next, blockedUsers);
+            return next;
+          });
+        }
+      },
+      { threshold: 1.0 }
+    );
+    if (loadMoreRef.current) observer.observe(loadMoreRef.current);
+    return () => observer.disconnect();
+  }, [isLoading, loadingMore, hasMore, fetchLogs, blockedUsers]);
+
+  const handleReport = (logId: string) => {
+    if (!myUserId) { setAlertMessage("로그인이 필요합니다."); return; }
+    setReportTargetId(logId);
+    setReportReason("");
+    setReportModalOpen(true);
+  };
+
+  const submitReport = async () => {
+    if (!reportReason.trim()) { setAlertMessage("사유를 한 글자라도 적어주세요!"); return; }
+    const { error } = await supabase.from('reports').insert({ reporter_id: myUserId, reported_log_id: reportTargetId, reason: reportReason });
+    setReportModalOpen(false);
+    if (!error) setAlertMessage("🚨 신고가 피도 눈물도 없이 접수되었습니다.");
+    else setAlertMessage("신고 접수 중 알 수 없는 DB 오류가 발생했습니다: " + error.message);
+  };
+
+  const handleBlockUser = async (blockedId: string) => {
+    if (!myUserId) { setAlertMessage("로그인이 필요합니다."); return; }
+    
+    setConfirmState({
+      message: "이 유저를 차단하시겠습니까? 앞으로 피드에서 보이지 않습니다.",
+      onConfirm: async () => {
+        setConfirmState(null);
+        const { error } = await supabase.from('blocks').insert({ blocker_id: myUserId, blocked_id: blockedId });
+        if (!error) {
+          setAlertMessage("차단되었습니다.");
+          loadBlockedUsers(myUserId).then(ids => {
+            setPage(0);
+            fetchLogs(0, ids);
+          });
+        } else {
+          setAlertMessage("차단 중 알 수 없는 DB 오류가 발생했습니다: " + error.message);
+        }
+      }
+    });
+  };
 
   const handleFileSelect = (e: React.ChangeEvent<HTMLInputElement>) => {
     if (!e.target.files) return;
@@ -391,6 +490,7 @@ export default function FeedPage() {
 
     if (!projectId) {
       setIsUploading(false);
+      setAlertMessage("❌ DB 오류: 프로젝트 생성에 실패했습니다. NAS Supabase에 테이블 구조(스키마)가 아직 만들어지지 않은 것 같습니다.");
       return;
     }
 
@@ -656,6 +756,12 @@ export default function FeedPage() {
               </Link>
             </Button>
           )}
+          
+          <div className="flex justify-center gap-3 px-2 mt-6 text-sm font-black text-slate-500 uppercase">
+            <Link href="/terms" className="hover:text-black hover:bg-yellow-200 px-2 py-1 transition-colors border-2 border-transparent hover:border-black">이용약관</Link>
+            <span className="py-1">|</span>
+            <Link href="/privacy" className="hover:text-black hover:bg-yellow-200 px-2 py-1 transition-colors border-2 border-transparent hover:border-black">개인정보</Link>
+          </div>
         </nav>
         
         {/* User Profile Block */}
@@ -822,7 +928,7 @@ export default function FeedPage() {
                         </AvatarFallback>
                       </Avatar>
                       <div className="flex flex-col gap-2 w-full">
-                        <div className="flex items-center gap-2 flex-wrap w-full">
+                        <div className="flex items-start justify-between w-full">
                           <button 
                             type="button"
                             onClick={(e) => { e.preventDefault(); setFilterProjectId(log.project_id); setFilterProjectName(log.projects?.title || 'Unknown'); setFilterUserId(null); window.scrollTo({top: 0, behavior: 'smooth'}); }}
@@ -831,6 +937,13 @@ export default function FeedPage() {
                           >
                             {log.projects?.title || 'Unknown'} 
                           </button>
+                          
+                          {myUserId && log.user_id !== myUserId && (
+                            <div className="flex gap-2 shrink-0 ml-2">
+                              <button onClick={(e) => { e.preventDefault(); handleReport(log.id); }} className="text-xs font-black bg-red-100 hover:bg-red-300 px-2 py-1 border-2 border-black shadow-[2px_2px_0px_0px_rgba(0,0,0,1)] active:shadow-none active:translate-x-[2px] active:translate-y-[2px] transition-all" title="이 글 신고하기">🚨 신고</button>
+                              <button onClick={(e) => { e.preventDefault(); handleBlockUser(log.user_id); }} className="text-xs font-black bg-slate-200 hover:bg-slate-400 px-2 py-1 border-2 border-black shadow-[2px_2px_0px_0px_rgba(0,0,0,1)] active:shadow-none active:translate-x-[2px] active:translate-y-[2px] transition-all" title="이 유저 차단하기">🚫 차단</button>
+                            </div>
+                          )}
                         </div>
                         <div className="flex flex-wrap items-center gap-3 text-base font-bold text-slate-800 bg-white/50 w-fit px-3 py-1 rounded-full border-2 border-black shadow-[2px_2px_0px_0px_rgba(0,0,0,1)] mt-1">
                           <button 
@@ -1042,6 +1155,22 @@ export default function FeedPage() {
 
               </Card>
             ))}
+            
+            {logs.length > 0 && hasMore && (
+              <div ref={loadMoreRef} className="py-10 flex justify-center w-full">
+                <div className="bg-yellow-300 text-black font-black uppercase tracking-widest px-6 py-2 border-4 border-black shadow-[4px_4px_0px_0px_rgba(0,0,0,1)] animate-pulse">
+                  Loading More...
+                </div>
+              </div>
+            )}
+            
+            {!hasMore && logs.length > 0 && (
+              <div className="py-12 mt-12 text-center text-black font-black bg-yellow-200 border-4 border-black shadow-[8px_8px_0px_0px_rgba(0,0,0,1)] hover:-rotate-1 transition-transform">
+                <span className="text-3xl sm:text-4xl">🛑 BAM! 🛑</span>
+                <p className="text-lg sm:text-xl mt-4 bg-white inline-block px-4 py-1 border-2 border-black">더 이상 파낼 과거의 흑역사(작업)가 없습니다!</p>
+                <p className="text-sm mt-3 font-bold text-slate-800">커피 한 잔의 여유를 가지거나 새로운 기록을 폭발시키세요.</p>
+              </div>
+            )}
           </div>
 
         </div>
@@ -1086,6 +1215,20 @@ export default function FeedPage() {
         </div>
       )}
 
+      {/* Custom Confirm Modal */}
+      {confirmState && (
+        <div className="fixed inset-0 z-[120] flex items-center justify-center bg-black/60 backdrop-blur-sm px-4 animate-in fade-in duration-200">
+          <div className={`bg-white p-8 max-w-sm w-full flex flex-col items-center text-center ${cardBorder} shadow-[12px_12px_0px_0px_rgba(255,255,255,1)] animate-in zoom-in-95 duration-200`}>
+            <h3 className="text-4xl font-black mb-4 tracking-tight uppercase">선택</h3>
+            <p className="text-xl font-bold mb-8 text-black opacity-80 whitespace-pre-wrap leading-tight">{confirmState.message}</p>
+            <div className="flex gap-4 w-full">
+              <Button type="button" onClick={() => setConfirmState(null)} className={`flex-1 bg-white text-black hover:bg-slate-200 py-6 border-4 border-black text-xl font-black shadow-[4px_4px_0px_0px_rgba(0,0,0,1)] active:translate-x-[2px] active:translate-y-[2px] active:shadow-none transition-all`}>취소</Button>
+              <Button type="button" onClick={confirmState.onConfirm} className={`flex-1 bg-red-400 text-black hover:bg-red-500 py-6 border-4 border-black text-xl font-black shadow-[4px_4px_0px_0px_rgba(0,0,0,1)] active:translate-x-[2px] active:translate-y-[2px] active:shadow-none transition-all`}>실행</Button>
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* Custom Alert Modal Overlay */}
       {alertMessage && (
         <div className="fixed inset-0 z-[100] flex items-center justify-center bg-black/60 backdrop-blur-sm p-4 animate-in fade-in duration-200">
@@ -1095,6 +1238,26 @@ export default function FeedPage() {
             <Button onClick={() => setAlertMessage(null)} className={`w-full py-6 bg-black hover:bg-slate-800 text-white font-black text-xl ${brutalBorder} shadow-[4px_4px_0px_0px_rgba(0,0,0,0.5)] active:translate-x-[4px] active:translate-y-[4px] active:shadow-none transition-all`}>
               확인
             </Button>
+          </div>
+        </div>
+      )}
+
+      {/* 브루탈리즘 신고 모달 */}
+      {reportModalOpen && (
+        <div className="fixed inset-0 z-[110] flex items-center justify-center bg-black/80 px-4 animate-in fade-in duration-200">
+          <div className={`bg-red-400 p-8 max-w-sm w-full flex flex-col items-center text-center ${cardBorder} shadow-[12px_12px_0px_0px_rgba(255,255,255,1)] animate-in zoom-in-95 duration-200`}>
+            <h2 className="text-3xl font-black uppercase text-black mb-2 bg-yellow-300 inline-block px-2 border-2 border-black">🚨 신고하기</h2>
+            <p className="text-black font-bold mb-6 mt-4">어떤 불만사항이 있으신가요?<br/>관리자가 매의 눈으로 심사합니다.</p>
+            <textarea
+              value={reportReason}
+              onChange={(e) => setReportReason(e.target.value)}
+              placeholder="예: 욕설, 광고, 기분나쁨 등..."
+              className="w-full bg-white border-4 border-black p-3 font-bold text-black resize-none h-32 focus:outline-none focus:ring-4 focus:ring-yellow-300 shadow-[4px_4px_0px_0px_rgba(0,0,0,1)] mb-6"
+            />
+            <div className="flex gap-4 w-full">
+              <Button type="button" onClick={() => setReportModalOpen(false)} variant="outline" className={`flex-1 py-6 bg-white text-black font-black text-lg ${brutalBorder} shadow-[4px_4px_0px_0px_rgba(0,0,0,1)] active:translate-x-[2px] active:translate-y-[2px] active:shadow-none transition-all`}>취소</Button>
+              <Button type="button" onClick={submitReport} className={`flex-1 py-6 bg-black text-white font-black text-lg ${brutalBorder} shadow-[4px_4px_0px_0px_rgba(0,0,0,1)] hover:bg-slate-800 active:translate-x-[2px] active:translate-y-[2px] active:shadow-none transition-all`}>철퇴 내리기</Button>
+            </div>
           </div>
         </div>
       )}
